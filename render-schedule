@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+
+# ./render-schedule --schedule=schedule.json --overrides=overrides.json --from='2023-11-17T17:00:00Z' --until='2023-12-01T17:00:00Z' '[{"user": "alice", "start_at": "2023-11-20T17:00:00Z", "end_at": "2023-11-20T17:00:00Z"}, {"user": "bob", "start_at": "2023-11-20T17:00:00Z", "end_at": "2023-12-01T17:00:00Z"}]'
+
+import argparse
+import json
+from datetime import datetime, timedelta
+
+newSchedule = []
+
+
+def parse_args():
+    # Command-line argument parsing
+    parser = argparse.ArgumentParser(description='Render Schedule')
+    parser.add_argument('--schedule', type=str, help='Path to schedule JSON file', required=True)
+    parser.add_argument('--overrides', type=str, help='Path to overrides JSON file', required=True)
+    parser.add_argument('--from', dest='start_at', type=lambda x: datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ'),
+                        help='Start date and time in ISO format', required=True)
+    parser.add_argument('--until', dest='end_at', type=lambda x: datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ'),
+                        help='End date and time in ISO format', required=True)
+    # parser.add_argument('entries', nargs='+', type=json.loads, help='List of schedule entries as JSON')
+
+    return parser.parse_args()
+
+
+def add_entry(user, start, end):
+    # Add a new entry to the schedule
+    newSchedule.append({"user": user, "start_at": start, "end_at": end})
+
+
+def process_schedule(args):
+    # Process the main schedule and populate the initial entries
+    with open(args.schedule, 'r') as file:
+        schedule = json.load(file)
+        handover_start = schedule["handover_start_at"]
+        handover_object = datetime.strptime(handover_start, '%Y-%m-%dT%H:%M:%SZ')
+        amount_users = len(schedule["users"])
+        users_pointer = 0
+
+        # Increase date entries until the start date is reached
+        while handover_object < args.start_at:
+            handover_object = handover_object + timedelta(days=schedule["handover_interval_days"])
+            users_pointer += 1
+            if users_pointer == amount_users:
+                users_pointer = 0
+
+        # Add an entry for the initial period if needed
+        if handover_object > args.start_at:
+            if users_pointer == 0:
+                users_pointer = amount_users
+            users_pointer -= 1
+            add_entry(schedule["users"][users_pointer], args.start_at.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                      handover_object.strftime('%Y-%m-%dT%H:%M:%SZ'))
+
+        # Populate entries until the end date is reached
+        while handover_object < args.end_at:
+            end_s_object = handover_object + timedelta(days=schedule["handover_interval_days"])
+            if end_s_object < args.end_at:
+                add_entry(schedule["users"][users_pointer], handover_object.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                          end_s_object.strftime('%Y-%m-%dT%H:%M:%SZ'))
+            else:
+                add_entry(schedule["users"][users_pointer], handover_object.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                          args.end_at.strftime('%Y-%m-%dT%H:%M:%SZ'))
+            users_pointer += 1
+            if users_pointer == amount_users:
+                users_pointer = 0
+            handover_object = end_s_object
+
+
+def process_override(override, args):
+    # Process override entries and modify the schedule accordingly
+    override_start = datetime.strptime(override["start_at"], '%Y-%m-%dT%H:%M:%SZ')
+    override_end = datetime.strptime(override["end_at"], '%Y-%m-%dT%H:%M:%SZ')
+
+    # Check whether end date is after start date
+    if override_end <= override_start:
+        return
+
+    # Check whether schedule has no elements, if so, add the override entry and return
+    if len(newSchedule) == 0:
+        if override_start <= args.start_at and override_end >= args.end_at:
+            add_entry(override["user"], override["start_at"], override["end_at"])
+        return
+
+    # Find indices in the schedule
+    override_s_ind = 0
+    override_e_ind = len(newSchedule) - 1
+
+    # Find appropriate indices in the schedule
+    while override_s_ind < len(newSchedule) and override_start > datetime.strptime(
+            newSchedule[override_s_ind]["end_at"], '%Y-%m-%dT%H:%M:%SZ'):
+        override_s_ind += 1
+
+    if override_s_ind == len(newSchedule):
+        return
+
+    while override_e_ind > -1 and override_end < datetime.strptime(
+            newSchedule[override_e_ind]["start_at"], '%Y-%m-%dT%H:%M:%SZ'):
+        override_e_ind -= 1
+
+    if override_e_ind == -1:
+        return
+
+    # Adjust indices based on start and end dates
+    if override_start <= args.start_at:
+        override_s_ind = -1
+
+    if override_end >= args.end_at:
+        override_e_ind = len(newSchedule)
+
+    # Modify the schedule based on the override period
+    for i in range(override_s_ind + 1, override_e_ind):
+        newSchedule[i] = None
+
+    # Update the schedule based on different conditions
+    if override_s_ind == -1:
+        if override_e_ind != len(newSchedule):
+            newSchedule[override_e_ind]["start_at"] = override["end_at"]
+    else:
+        store = newSchedule[override_s_ind]["end_at"]
+        newSchedule[override_s_ind]["end_at"] = override["start_at"]
+
+        if override_s_ind == override_e_ind:
+            newSchedule.insert(override_s_ind + 1,
+                               {"user": newSchedule[override_s_ind]["user"],
+                                "start_at": override["end_at"],
+                                "end_at": store})
+        elif override_e_ind != len(newSchedule):
+            newSchedule[override_e_ind]["start_at"] = override["end_at"]
+
+    # Insert the override entry into the schedule
+    newSchedule.insert(override_s_ind + 1,
+                       {"user": override["user"],
+                        "start_at": override["end_at"],
+                        "end_at": override["start_at"]})
+
+
+def process_overrides(args):
+    with open(args.overrides, 'r') as file:
+        override = json.load(file)
+        if type(override) is dict:
+            process_override(override, args)
+        elif type(override) is list:
+            for i in override:
+                process_override(i, args)
+
+
+def main():
+    args = parse_args()
+
+    # Accessing the parsed arguments
+    # print(f"Schedule file: {args.schedule}")
+    # print(f"Overrides file: {args.overrides}")
+    # print(f"Start date and time: {args.start_at}")
+    # print(f"End date and time: {args.end_at}")
+
+    process_schedule(args)
+
+    process_overrides(args)
+
+    # print(newSchedule)
+
+    # Processing the list of entries
+    # print("List of Entries:")
+    # for i, entry in enumerate(args.entries, start=1):
+    #     print(f"Entry {i}: {entry}")
+
+
+if __name__ == "__main__":
+    main()
